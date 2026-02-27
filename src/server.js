@@ -175,6 +175,14 @@ async function startGateway() {
   if (gatewayProc) return;
   if (!isConfigured()) throw new Error("Gateway cannot start: not configured");
 
+  // Guard: if the port is already in use (e.g. OpenClaw did an internal self-restart
+  // and spawned a new child process we don't track), skip the spawn to avoid a crash loop.
+  const portBusy = await probeGateway();
+  if (portBusy) {
+    console.log(`[gateway] port ${INTERNAL_GATEWAY_PORT} already in use — assuming gateway self-restarted, skipping spawn`);
+    return;
+  }
+
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
 
@@ -233,6 +241,15 @@ async function runDoctorBestEffort() {
 async function ensureGatewayRunning() {
   if (!isConfigured()) return { ok: false, reason: "not configured" };
   if (gatewayProc) return { ok: true };
+
+  // The gateway may have self-restarted (OpenClaw spawns a replacement process internally).
+  // If the port is reachable, the gateway is alive even though we lost the process handle.
+  try {
+    if (await probeGateway()) return { ok: true };
+  } catch {
+    // probe failed — proceed with normal startup
+  }
+
   if (!gatewayStarting) {
     gatewayStarting = (async () => {
       try {
@@ -268,6 +285,19 @@ async function restartGateway() {
     await sleep(750);
     gatewayProc = null;
   }
+
+  // If an untracked gateway (from a self-restart) is holding the port,
+  // ask OpenClaw CLI to stop it before we try to start a fresh one.
+  try {
+    if (await probeGateway()) {
+      console.log("[gateway] port still in use after kill — running `openclaw gateway stop`");
+      await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]), { timeoutMs: 10_000 });
+      await sleep(1_000);
+    }
+  } catch {
+    // best-effort
+  }
+
   return ensureGatewayRunning();
 }
 
@@ -1350,13 +1380,23 @@ function requireDashboardAuth(req, res, next) {
   return next();
 }
 
-// --- Gateway token injection ---
+// --- Gateway auth + origin injection ---
 // The gateway is only reachable from this container. The Control UI in the browser
 // cannot set custom Authorization headers for WebSocket connections, so we inject
 // the token into proxied requests at the wrapper level.
-function attachGatewayAuthHeader(req) {
+// We also rewrite the Origin header so the gateway accepts the request as local;
+// the wrapper already handles authentication, so the gateway origin check is redundant.
+function attachGatewayHeaders(req) {
   if (!req?.headers?.authorization && OPENCLAW_GATEWAY_TOKEN) {
     req.headers.authorization = `Bearer ${OPENCLAW_GATEWAY_TOKEN}`;
+  }
+  // Rewrite origin to match the internal gateway target so the gateway's
+  // controlUi.allowedOrigins check passes. The wrapper owns the public auth layer.
+  if (req?.headers?.origin) {
+    req.headers.origin = GATEWAY_TARGET;
+  }
+  if (req?.headers?.host) {
+    req.headers.host = `${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`;
   }
 }
 
@@ -1382,7 +1422,7 @@ app.use(requireDashboardAuth, async (req, res) => {
     }
   }
 
-  attachGatewayAuthHeader(req);
+  attachGatewayHeaders(req);
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
 
@@ -1435,7 +1475,10 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
       await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "token"]));
       await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
       await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
-      console.log("[wrapper] gateway tokens synced");
+      // Allow any origin so the Control UI works behind Railway's reverse proxy.
+      // The wrapper already enforces authentication; the gateway origin check is redundant.
+      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowedOrigins", JSON.stringify(["*"])]));
+      console.log("[wrapper] gateway tokens + allowedOrigins synced");
     } catch (err) {
       console.warn(`[wrapper] failed to sync gateway tokens: ${String(err)}`);
     }
@@ -1482,7 +1525,7 @@ server.on("upgrade", async (req, socket, head) => {
     socket.destroy();
     return;
   }
-  attachGatewayAuthHeader(req);
+  attachGatewayHeaders(req);
   proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
 });
 
