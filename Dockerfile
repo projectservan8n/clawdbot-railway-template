@@ -21,7 +21,7 @@ RUN corepack enable
 WORKDIR /openclaw
 
 # Pin to a known-good ref (tag/branch). Override in Railway template settings if needed.
-ARG OPENCLAW_GIT_REF=v2026.2.26
+ARG OPENCLAW_GIT_REF=v2026.3.2
 RUN git clone --depth 1 --branch "${OPENCLAW_GIT_REF}" https://github.com/openclaw/openclaw.git .
 
 RUN set -eux; \
