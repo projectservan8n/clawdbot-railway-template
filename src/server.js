@@ -449,6 +449,8 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
         <option value="openclaw.devices.approve">openclaw devices approve &lt;requestId&gt;</option>
         <option value="openclaw.plugins.list">openclaw plugins list</option>
         <option value="openclaw.plugins.enable">openclaw plugins enable &lt;name&gt;</option>
+        <option value="claude-code.workspace.list">claude-code workspace list</option>
+        <option value="claude-code.status">claude-code status check</option>
       </select>
       <input id="consoleArg" placeholder="Optional arg (e.g. 200, gateway.port)" style="flex: 1" />
       <button id="consoleRun" style="background:#0f172a">Run</button>
@@ -894,6 +896,27 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       }
     }
 
+    // Register Claude Code MCP plugin.
+    {
+      const mcpPluginConfig = {
+        type: "mcp",
+        command: "node",
+        args: ["/app/src/mcp/claude-code-server.js"],
+        env: {
+          OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+          CLAUDE_CONFIG_DIR: STATE_DIR,
+          ...(process.env.ANTHROPIC_API_KEY ? { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY } : {}),
+        },
+      };
+      const mcpSet = await runCmd(
+        OPENCLAW_NODE,
+        clawArgs(["config", "set", "--json", "plugins.entries.claude-code", JSON.stringify(mcpPluginConfig)]),
+      );
+      extra += `\n[claude-code MCP] exit=${mcpSet.code}\n${mcpSet.output || "(no output)"}`;
+      const mcpEnable = await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "enable", "claude-code"]));
+      extra += `\n[claude-code plugin enable] exit=${mcpEnable.code}\n${mcpEnable.output || "(no output)"}`;
+    }
+
     // Apply changes immediately.
     await restartGateway();
 
@@ -1017,6 +1040,10 @@ const ALLOWED_CONSOLE_COMMANDS = new Set([
   // Plugin management
   "openclaw.plugins.list",
   "openclaw.plugins.enable",
+
+  // Claude Code MCP
+  "claude-code.workspace.list",
+  "claude-code.status",
 ]);
 
 app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
@@ -1101,6 +1128,35 @@ app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
       if (!/^[A-Za-z0-9_-]+$/.test(name)) return res.status(400).json({ ok: false, error: "Invalid plugin name" });
       const r = await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "enable", name]));
       return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
+    }
+
+    // --- Claude Code MCP commands ---
+    if (cmd === "claude-code.workspace.list") {
+      try {
+        const entries = fs.readdirSync(WORKSPACE_DIR, { withFileTypes: true });
+        const dirs = entries.filter((e) => e.isDirectory() && !e.name.startsWith(".")).map((e) => e.name);
+        return res.json({ ok: true, output: `Workspace: ${WORKSPACE_DIR}\nProjects:\n${dirs.join("\n") || "(empty)"}` });
+      } catch (err) {
+        return res.json({ ok: false, output: `Cannot read workspace: ${String(err)}` });
+      }
+    }
+    if (cmd === "claude-code.status") {
+      let sdkOk = false;
+      try {
+        await runCmd("node", ["-e", "import('@anthropic-ai/claude-code').then(() => console.log('OK'))"], { timeoutMs: 10_000 });
+        sdkOk = true;
+      } catch {}
+      const hasApiKey = Boolean(process.env.ANTHROPIC_API_KEY?.trim());
+      const hasCredDir = fs.existsSync(path.join(STATE_DIR, "credentials"));
+      return res.json({
+        ok: true,
+        output: [
+          `Claude Code SDK: ${sdkOk ? "loaded OK" : "NOT FOUND (is @anthropic-ai/claude-code installed?)"}`,
+          `ANTHROPIC_API_KEY env: ${hasApiKey ? "set" : "not set"}`,
+          `Credentials dir (${STATE_DIR}/credentials): ${hasCredDir ? "exists" : "missing"}`,
+          `Workspace: ${WORKSPACE_DIR}`,
+        ].join("\n"),
+      });
     }
 
     return res.status(400).json({ ok: false, error: "Unhandled command" });
@@ -1481,6 +1537,31 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
       console.log("[wrapper] gateway tokens + allowedOrigins synced");
     } catch (err) {
       console.warn(`[wrapper] failed to sync gateway tokens: ${String(err)}`);
+    }
+  }
+
+  // Ensure Claude Code MCP plugin is registered (survives config edits / resets).
+  if (isConfigured()) {
+    try {
+      const pluginCheck = await runCmd(OPENCLAW_NODE, clawArgs(["config", "get", "plugins.entries.claude-code"]));
+      if (pluginCheck.code !== 0 || !pluginCheck.output.includes("mcp")) {
+        console.log("[wrapper] re-registering claude-code MCP plugin...");
+        const mcpCfg = JSON.stringify({
+          type: "mcp",
+          command: "node",
+          args: ["/app/src/mcp/claude-code-server.js"],
+          env: {
+            OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+            CLAUDE_CONFIG_DIR: STATE_DIR,
+            ...(process.env.ANTHROPIC_API_KEY ? { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY } : {}),
+          },
+        });
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "plugins.entries.claude-code", mcpCfg]));
+        await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "enable", "claude-code"]));
+        console.log("[wrapper] claude-code MCP plugin registered");
+      }
+    } catch (err) {
+      console.warn(`[wrapper] failed to verify claude-code plugin: ${String(err)}`);
     }
   }
 

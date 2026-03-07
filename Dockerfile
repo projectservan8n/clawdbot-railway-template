@@ -46,12 +46,7 @@ RUN apt-get update \
     tini \
     python3 \
     python3-venv \
-    curl \
-    iptables \
   && rm -rf /var/lib/apt/lists/*
-
-# Install Tailscale
-RUN curl -fsSL https://tailscale.com/install.sh | sh
 
 # `openclaw update` expects pnpm. Provide it in the runtime image.
 RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
@@ -67,16 +62,22 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev && npm cache clean --force
 
+# Install Claude Code CLI globally for MCP server
+RUN npm install -g @anthropic-ai/claude-code && npm cache clean --force
+
+# Git needed in runtime for clone_repo MCP tool
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git \
+  && rm -rf /var/lib/apt/lists/*
+
 COPY --from=openclaw-build /openclaw /openclaw
 
 RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/entry.js "$@"' > /usr/local/bin/openclaw \
   && chmod +x /usr/local/bin/openclaw
 
 COPY src ./src
-COPY scripts/start.sh ./scripts/start.sh
-RUN chmod +x ./scripts/start.sh
 
 EXPOSE 8080
 
 ENTRYPOINT ["tini", "--"]
-CMD ["./scripts/start.sh"]
+CMD ["node", "src/server.js"]
