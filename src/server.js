@@ -118,9 +118,28 @@ function isConfigured() {
   if (process.env.OPENCLAW_CONFIG_PATH?.trim()) return;
 
   const canonical = path.join(STATE_DIR, "openclaw.json");
+
+  // Special case: if opus.json exists, it takes priority over openclaw.json
+  // because a previous rebrand may have moved the real config there while a
+  // stale openclaw.json was recreated by config sync commands.
+  const opusPath = path.join(STATE_DIR, "opus.json");
+  try {
+    if (fs.existsSync(opusPath)) {
+      if (fs.existsSync(canonical)) {
+        fs.unlinkSync(canonical);
+        console.log("[migration] Removed stale openclaw.json in favour of opus.json");
+      }
+      fs.renameSync(opusPath, canonical);
+      console.log("[migration] Renamed opus.json → openclaw.json");
+      return;
+    }
+  } catch (err) {
+    console.warn(`[migration] Failed to migrate opus.json: ${err}`);
+  }
+
   if (fs.existsSync(canonical)) return;
 
-  for (const legacy of ["opus.json", "clawdbot.json", "moltbot.json"]) {
+  for (const legacy of ["clawdbot.json", "moltbot.json"]) {
     const legacyPath = path.join(STATE_DIR, legacy);
     try {
       if (fs.existsSync(legacyPath)) {
