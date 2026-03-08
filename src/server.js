@@ -120,7 +120,7 @@ function isConfigured() {
   const canonical = path.join(STATE_DIR, "openclaw.json");
   if (fs.existsSync(canonical)) return;
 
-  for (const legacy of ["clawdbot.json", "moltbot.json"]) {
+  for (const legacy of ["opus.json", "clawdbot.json", "moltbot.json"]) {
     const legacyPath = path.join(STATE_DIR, legacy);
     try {
       if (fs.existsSync(legacyPath)) {
