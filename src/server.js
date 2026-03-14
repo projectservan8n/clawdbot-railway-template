@@ -438,6 +438,8 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
     <div style="margin-top: 0.75rem">
       <a href="/openclaw" target="_blank">Open OpenClaw UI</a>
       &nbsp;|&nbsp;
+      <a href="/folders" target="_blank">File Manager</a>
+      &nbsp;|&nbsp;
       <a href="/setup/export" target="_blank">Download backup (.tar.gz)</a>
     </div>
 
@@ -1419,6 +1421,210 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
     res.status(500).type("text/plain").send(String(err));
   }
 });
+
+// ─── File Manager (/folders) ───────────────────────────────────────────────────
+// Full filesystem browser/editor served at /folders, API at /folders/api/*.
+
+app.get("/folders", requireSetupAuth, (_req, res) => {
+  res.type("html").send(fs.readFileSync(path.join(process.cwd(), "src", "folders-page.html"), "utf8"));
+});
+
+// Helpers for the file manager API
+const FM_MAX_READ = 10 * 1024 * 1024; // 10 MB read limit
+
+function fmSafePath(p) {
+  // Resolve and normalise — no traversal tricks
+  const resolved = path.resolve("/", p || "/");
+  return resolved;
+}
+
+app.get("/folders/api/ls", requireSetupAuth, async (req, res) => {
+  try {
+    const dirPath = fmSafePath(req.query.path);
+    const raw = fs.readdirSync(dirPath, { withFileTypes: true });
+    const entries = raw.map((d) => {
+      const full = path.join(dirPath, d.name);
+      let size = 0;
+      let mtime = null;
+      try {
+        const st = fs.statSync(full);
+        size = st.size;
+        mtime = st.mtime.toISOString();
+      } catch {}
+      return { name: d.name, type: d.isDirectory() ? "directory" : "file", size, mtime };
+    });
+    res.json({ ok: true, path: dirPath, entries });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+app.get("/folders/api/read", requireSetupAuth, async (req, res) => {
+  try {
+    const filePath = fmSafePath(req.query.path);
+    const st = fs.statSync(filePath);
+    if (st.size > FM_MAX_READ) {
+      return res.status(400).json({ ok: false, error: `File too large (${(st.size / 1048576).toFixed(1)} MB). Max ${FM_MAX_READ / 1048576} MB.` });
+    }
+    const content = fs.readFileSync(filePath, "utf8");
+    res.json({ ok: true, path: filePath, content, size: st.size, mtime: st.mtime.toISOString() });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+app.post("/folders/api/write", requireSetupAuth, (req, res) => {
+  try {
+    const { path: filePath, content } = req.body;
+    if (!filePath) return res.status(400).json({ ok: false, error: "Missing path" });
+    const resolved = fmSafePath(filePath);
+    // Ensure parent directory exists
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    fs.writeFileSync(resolved, content ?? "");
+    res.json({ ok: true, path: resolved });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+app.post("/folders/api/mkdir", requireSetupAuth, (req, res) => {
+  try {
+    const { path: dirPath } = req.body;
+    if (!dirPath) return res.status(400).json({ ok: false, error: "Missing path" });
+    const resolved = fmSafePath(dirPath);
+    fs.mkdirSync(resolved, { recursive: true });
+    res.json({ ok: true, path: resolved });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+app.post("/folders/api/rename", requireSetupAuth, (req, res) => {
+  try {
+    const { oldPath, newPath } = req.body;
+    if (!oldPath || !newPath) return res.status(400).json({ ok: false, error: "Missing oldPath or newPath" });
+    fs.renameSync(fmSafePath(oldPath), fmSafePath(newPath));
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+app.post("/folders/api/delete", requireSetupAuth, (req, res) => {
+  try {
+    const { path: targetPath } = req.body;
+    if (!targetPath) return res.status(400).json({ ok: false, error: "Missing path" });
+    const resolved = fmSafePath(targetPath);
+    fs.rmSync(resolved, { recursive: true, force: true });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+app.get("/folders/api/download", requireSetupAuth, (req, res) => {
+  try {
+    const filePath = fmSafePath(req.query.path);
+    const name = path.basename(filePath);
+    res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
+    const stream = fs.createReadStream(filePath);
+    stream.on("error", (err) => {
+      if (!res.headersSent) res.status(400).json({ ok: false, error: String(err.message) });
+    });
+    stream.pipe(res);
+  } catch (err) {
+    res.status(400).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+// Upload uses multipart/form-data. We parse it manually with no extra deps.
+app.post("/folders/api/upload", requireSetupAuth, (req, res) => {
+  const contentType = req.headers["content-type"] || "";
+  if (!contentType.includes("multipart/form-data")) {
+    return res.status(400).json({ ok: false, error: "Expected multipart/form-data" });
+  }
+
+  const chunks = [];
+  req.on("data", (chunk) => chunks.push(chunk));
+  req.on("end", () => {
+    try {
+      const buf = Buffer.concat(chunks);
+      const boundaryMatch = contentType.match(/boundary=(.+)/);
+      if (!boundaryMatch) return res.status(400).json({ ok: false, error: "Missing boundary" });
+
+      const boundary = boundaryMatch[1].replace(/;.*$/, "").trim();
+      const parts = parseMultipart(buf, boundary);
+
+      const dirPart = parts.find((p) => p.name === "dir");
+      const filePart = parts.find((p) => p.name === "file");
+      if (!filePart) return res.status(400).json({ ok: false, error: "Missing file part" });
+
+      const dir = fmSafePath(dirPart ? dirPart.data.toString() : "/");
+      const filename = filePart.filename || "upload";
+      const dest = path.join(dir, filename);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(dest, filePart.data);
+      res.json({ ok: true, path: dest });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err.message || err) });
+    }
+  });
+});
+
+// Minimal multipart parser (no external deps)
+function parseMultipart(buf, boundary) {
+  const parts = [];
+  const boundaryBuf = Buffer.from("--" + boundary);
+  const crlf = Buffer.from("\r\n");
+  const doubleCrlf = Buffer.from("\r\n\r\n");
+
+  let pos = 0;
+  // Find first boundary
+  pos = bufIndexOf(buf, boundaryBuf, pos);
+  if (pos < 0) return parts;
+  pos += boundaryBuf.length;
+
+  while (pos < buf.length) {
+    // Check for end marker
+    if (buf[pos] === 0x2d && buf[pos + 1] === 0x2d) break; // "--"
+    // Skip CRLF after boundary
+    if (buf[pos] === 0x0d && buf[pos + 1] === 0x0a) pos += 2;
+
+    // Find headers end
+    const headersEnd = bufIndexOf(buf, doubleCrlf, pos);
+    if (headersEnd < 0) break;
+    const headersStr = buf.slice(pos, headersEnd).toString();
+    pos = headersEnd + doubleCrlf.length;
+
+    // Find next boundary
+    const nextBoundary = bufIndexOf(buf, boundaryBuf, pos);
+    if (nextBoundary < 0) break;
+    // Data is between pos and nextBoundary - 2 (strip trailing CRLF)
+    const data = buf.slice(pos, nextBoundary - 2);
+    pos = nextBoundary + boundaryBuf.length;
+
+    // Parse headers
+    const nameMatch = headersStr.match(/name="([^"]+)"/);
+    const filenameMatch = headersStr.match(/filename="([^"]+)"/);
+    parts.push({
+      name: nameMatch ? nameMatch[1] : "",
+      filename: filenameMatch ? filenameMatch[1] : null,
+      data,
+    });
+  }
+  return parts;
+}
+
+function bufIndexOf(buf, search, start) {
+  for (let i = start || 0; i <= buf.length - search.length; i++) {
+    let match = true;
+    for (let j = 0; j < search.length; j++) {
+      if (buf[i + j] !== search[j]) { match = false; break; }
+    }
+    if (match) return i;
+  }
+  return -1;
+}
 
 // Proxy everything else to the gateway.
 const proxy = httpProxy.createProxyServer({
